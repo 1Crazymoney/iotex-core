@@ -393,7 +393,9 @@ func (ws *workingSet) pickAndRunActions(
 	// initial action iterator
 	blkCtx := protocol.MustGetBlockCtx(ctx)
 	if ap != nil {
+		initTimer := timerFactory.NewTimer("new_action_iterator")
 		actionIterator := actioniterator.NewActionIterator(ap.PendingActionMap())
+		initTimer.End()
 		for {
 			nextAction, ok := actionIterator.Next()
 			if !ok {
@@ -413,6 +415,7 @@ func (ws *workingSet) pickAndRunActions(
 				}
 			}
 			if err != nil {
+				stateDBMtc.WithLabelValues("validate_error").Inc()
 				caller, err := address.FromBytes(nextAction.SrcPubkey().Hash())
 				if err != nil {
 					return nil, nil, err
