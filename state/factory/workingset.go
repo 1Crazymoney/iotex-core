@@ -24,6 +24,7 @@ import (
 	"github.com/iotexproject/iotex-core/blockchain/block"
 	"github.com/iotexproject/iotex-core/db"
 	"github.com/iotexproject/iotex-core/pkg/log"
+	"github.com/iotexproject/iotex-core/pkg/prometheustimer"
 	"github.com/iotexproject/iotex-core/state"
 )
 
@@ -35,10 +36,20 @@ var (
 		},
 		[]string{"type"},
 	)
+	timerFactory *prometheustimer.TimerFactory
 )
 
 func init() {
 	prometheus.MustRegister(stateDBMtc)
+	var err error
+	if timerFactory, err = prometheustimer.New(
+		"workingset_perf",
+		"Performance of workingset",
+		[]string{"topic"},
+		[]string{"default"},
+	); err != nil {
+		log.L().Panic("Failed to generate prometheus timer factory for workingset.", zap.Error(err))
+	}
 }
 
 type (
@@ -66,6 +77,8 @@ type (
 )
 
 func (ws *workingSet) digest() (hash.Hash256, error) {
+	timer := timerFactory.NewTimer("digest")
+	defer timer.End()
 	if !ws.finalized {
 		return hash.ZeroHash256, errors.New("workingset has not been finalized yet")
 	}
@@ -357,6 +370,8 @@ func (ws *workingSet) pickAndRunActions(
 	postSystemActions []action.SealedEnvelope,
 	allowedBlockGasResidue uint64,
 ) ([]*action.Receipt, []action.SealedEnvelope, error) {
+	timer := timerFactory.NewTimer("pick_and_run_actions")
+	defer timer.End()
 	err := ws.validate(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -365,6 +380,7 @@ func (ws *workingSet) pickAndRunActions(
 	executedActions := make([]action.SealedEnvelope, 0)
 	reg := protocol.MustGetRegistry(ctx)
 
+	preTimer := timerFactory.NewTimer("create_pre_states")
 	for _, p := range reg.All() {
 		if pp, ok := p.(protocol.PreStatesCreator); ok {
 			if err := pp.CreatePreStates(ctx, ws); err != nil {
@@ -372,6 +388,7 @@ func (ws *workingSet) pickAndRunActions(
 			}
 		}
 	}
+	preTimer.End()
 
 	// initial action iterator
 	blkCtx := protocol.MustGetBlockCtx(ctx)
@@ -428,7 +445,8 @@ func (ws *workingSet) pickAndRunActions(
 			}
 		}
 	}
-
+	postTimer := timerFactory.NewTimer("create_post_actions")
+	defer postTimer.End()
 	for _, selp := range postSystemActions {
 		if ctx, err = withActionCtx(ctx, selp); err != nil {
 			return nil, nil, err
