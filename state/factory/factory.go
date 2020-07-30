@@ -89,17 +89,18 @@ type (
 
 	// factory implements StateFactory interface, tracks changes to account/contract and batch-commits to DB
 	factory struct {
-		lifecycle          lifecycle.Lifecycle
-		mutex              sync.RWMutex
-		cfg                config.Config
-		registry           *protocol.Registry
-		currentChainHeight uint64
-		saveHistory        bool
-		twoLayerTrie       trie.TwoLayerTrie // global state trie, this is a read only trie
-		dao                db.KVStore        // the underlying DB for account/contract storage
-		timerFactory       *prometheustimer.TimerFactory
-		workingsets        *lru.Cache // lru cache for workingsets
-		protocolView       protocol.Dock
+		lifecycle                lifecycle.Lifecycle
+		mutex                    sync.RWMutex
+		cfg                      config.Config
+		registry                 *protocol.Registry
+		currentChainHeight       uint64
+		saveHistory              bool
+		twoLayerTrie             trie.TwoLayerTrie // global state trie, this is a read only trie
+		dao                      db.KVStore        // the underlying DB for account/contract storage
+		timerFactory             *prometheustimer.TimerFactory
+		workingsets              *lru.Cache // lru cache for workingsets
+		protocolView             protocol.View
+		skipBlockValidationOnPut bool
 	}
 )
 
@@ -146,6 +147,14 @@ func RegistryOption(reg *protocol.Registry) Option {
 	}
 }
 
+// SkipBlockValidationOption skips block validation on PutBlock
+func SkipBlockValidationOption() Option {
+	return func(sf *factory, cfg config.Config) error {
+		sf.skipBlockValidationOnPut = true
+		return nil
+	}
+}
+
 func newTwoLayerTrie(ns string, dao db.KVStore, rootKey string, create bool) (trie.TwoLayerTrie, error) {
 	dbForTrie, err := trie.NewKVStore(ns, dao)
 	if err != nil {
@@ -172,7 +181,7 @@ func NewFactory(cfg config.Config, opts ...Option) (Factory, error) {
 		currentChainHeight: 0,
 		registry:           protocol.NewRegistry(),
 		saveHistory:        cfg.Chain.EnableArchiveMode,
-		protocolView:       protocol.NewDock(),
+		protocolView:       protocol.View{},
 	}
 
 	for _, opt := range opts {
@@ -216,7 +225,7 @@ func (sf *factory) Start(ctx context.Context) error {
 	case nil:
 		sf.currentChainHeight = byteutil.BytesToUint64(h)
 		// start all protocols
-		if err := startAllProtocols(ctx, sf.registry, sf, sf.protocolView); err != nil {
+		if sf.protocolView, err = sf.registry.StartAll(ctx, sf); err != nil {
 			return err
 		}
 	case db.ErrNotExist:
@@ -224,7 +233,7 @@ func (sf *factory) Start(ctx context.Context) error {
 			return errors.Wrap(err, "failed to init factory's height")
 		}
 		// start all protocols
-		if err := startAllProtocols(ctx, sf.registry, sf, sf.protocolView); err != nil {
+		if sf.protocolView, err = sf.registry.StartAll(ctx, sf); err != nil {
 			return err
 		}
 		ctx = protocol.WithBlockCtx(
@@ -296,13 +305,13 @@ func (sf *factory) newWorkingSet(ctx context.Context, height uint64) (*workingSe
 			flusher.KVStoreWithBuffer().MustPut(ns, key, ss)
 			nsHash := hash.Hash160b([]byte(ns))
 
-			return tlt.Upsert(nsHash[:], key, ss)
+			return tlt.Upsert(nsHash[:], toLegacyKey(key), ss)
 		},
 		delStateFunc: func(ns string, key []byte) error {
 			flusher.KVStoreWithBuffer().MustDelete(ns, key)
 			nsHash := hash.Hash160b([]byte(ns))
 
-			err := tlt.Delete(nsHash[:], key)
+			err := tlt.Delete(nsHash[:], toLegacyKey(key))
 			if errors.Cause(err) == trie.ErrNotExist {
 				return errors.Wrapf(state.ErrStateNotExist, "key %x doesn't exist in namespace %x", key, nsHash)
 			}
@@ -348,11 +357,11 @@ func (sf *factory) newWorkingSet(ctx context.Context, height uint64) (*workingSe
 			sf.currentChainHeight = h
 			return nil
 		},
-		readviewFunc: func(name string) (interface{}, error) {
-			return sf.protocolView.Unload(name)
+		readviewFunc: func(name string) (uint64, interface{}, error) {
+			return sf.ReadView(name)
 		},
 		writeviewFunc: func(name string, v interface{}) error {
-			return sf.protocolView.Load(name, v)
+			return sf.protocolView.Write(name, v)
 		},
 		snapshotFunc: func() int {
 			rh, err := tlt.RootHash()
@@ -528,7 +537,11 @@ func (sf *factory) PutBlock(ctx context.Context, blk *block.Block) error {
 	}
 	if !isExist {
 		// regenerate workingset
-		_, err = ws.Process(ctx, blk.RunnableActions().Actions())
+		if !sf.skipBlockValidationOnPut {
+			err = ws.ValidateBlock(ctx, blk)
+		} else {
+			_, err = ws.Process(ctx, blk.RunnableActions().Actions())
+		}
 		if err != nil {
 			log.L().Error("Failed to update state.", zap.Error(err))
 			return err
@@ -623,8 +636,9 @@ func (sf *factory) States(opts ...protocol.StateOption) (uint64, state.Iterator,
 }
 
 // ReadView reads the view
-func (sf *factory) ReadView(name string) (interface{}, error) {
-	return sf.protocolView.Unload(name)
+func (sf *factory) ReadView(name string) (uint64, interface{}, error) {
+	v, err := sf.protocolView.Read(name)
+	return sf.currentChainHeight, v, err
 }
 
 //======================================
@@ -641,7 +655,8 @@ func namespaceKey(ns string) []byte {
 }
 
 func readState(tlt trie.TwoLayerTrie, ns string, key []byte, s interface{}) error {
-	data, err := tlt.Get(namespaceKey(ns), key)
+	ltKey := toLegacyKey(key)
+	data, err := tlt.Get(namespaceKey(ns), ltKey)
 	if err != nil {
 		if errors.Cause(err) == trie.ErrNotExist {
 			return errors.Wrapf(state.ErrStateNotExist, "failed to get state of ns = %x and key = %x", ns, key)
@@ -650,6 +665,11 @@ func readState(tlt trie.TwoLayerTrie, ns string, key []byte, s interface{}) erro
 	}
 
 	return state.Deserialize(s, data)
+}
+
+func toLegacyKey(input []byte) []byte {
+	key := hash.Hash160b(input)
+	return key[:]
 }
 
 func (sf *factory) stateAtHeight(height uint64, ns string, key []byte, s interface{}) error {
