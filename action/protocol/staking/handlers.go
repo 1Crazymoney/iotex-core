@@ -546,6 +546,9 @@ func (p *Protocol) handleRestake(ctx context.Context, act *action.Restake, csm C
 	}
 	bucket.StakedDuration = actDuration
 	bucket.StakeStartTime = blkCtx.BlockTimeStamp.UTC()
+	if p.hu.IsPost(config.Greenland, blkCtx.BlockHeight) {
+		bucket.UnstakeStartTime = time.Unix(0, 0).UTC()
+	}
 	bucket.AutoStake = act.AutoStake()
 	if err := updateBucket(csm, act.BucketIndex(), bucket); err != nil {
 		return log, errors.Wrapf(err, "failed to update bucket for voter %s", bucket.Owner.String())
